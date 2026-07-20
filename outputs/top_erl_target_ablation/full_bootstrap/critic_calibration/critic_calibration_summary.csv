@@ -1,0 +1,2 @@
+seed,q_reward_corr_mean,q_last_reward_corr,q_throughput_corr,q_fairness_corr,mean_top1_regret,predicted_q_mean,predicted_q_std,predicted_q_min,predicted_q_max,actual_reward_mean,actual_reward_std,actual_reward_min,actual_reward_max,all_finite
+0,-0.05189171743373554,-0.04389209389320976,0.015431298536192016,-0.04729805408830692,0.2161348687769986,-0.18646555947780144,0.22629294964043944,-1.3953825235366821,0.35740235447883606,0.05872729226857678,0.08576367834703623,0.0,0.5601821797189459,True

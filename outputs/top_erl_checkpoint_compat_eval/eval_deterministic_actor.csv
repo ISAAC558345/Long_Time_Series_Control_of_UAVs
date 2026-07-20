@@ -1,0 +1,2 @@
+policy_type,episode,std_scale,cumulative_reward,TotalThroughput,FairIdx,ProbCollision,trajectory_smoothness,path_curvature,oscillation_metric,boundary_violation_ratio,coverage_radius_per_uav,coverage_consistency,done
+deterministic_actor,0,1.0,0.0,0.0,1.0,0.0,3682.924560546875,0.00017961481353268027,0.0,0.0,100.0,1.0,False

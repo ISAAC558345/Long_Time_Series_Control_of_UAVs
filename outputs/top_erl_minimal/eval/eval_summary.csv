@@ -1,0 +1,4 @@
+policy_type,std_scale,num_episodes,mean_cumulative_reward,std_cumulative_reward,mean_TotalThroughput,std_TotalThroughput,mean_FairIdx,std_FairIdx,mean_ProbCollision,std_ProbCollision,mean_trajectory_smoothness,std_trajectory_smoothness,mean_path_curvature,std_path_curvature,mean_oscillation_metric,std_oscillation_metric,mean_boundary_violation_ratio,std_boundary_violation_ratio,mean_coverage_radius_per_uav,all_metrics_finite
+deterministic_actor,,5,0.07476185314517061,0.0,0.06060202792286873,0.0,0.44569918513298035,0.0,0.0,0.0,,,,,,,,,,True
+random_baseline,,5,0.07606121626634141,0.04603704217873437,0.06957494206726551,0.028003991758687993,0.339778470993042,0.07757063315980783,0.0,0.0,,,,,,,,,,True
+deterministic_actor,1.0,5,0.07351286111987294,0.0,0.05979500710964203,0.0,0.44811826944351196,0.0,0.0,0.0,85.1651382446289,0.0,0.00013097947521600872,0.0,0.0,0.0,0.0,0.0,100.0,True

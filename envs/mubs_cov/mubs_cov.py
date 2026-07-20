@@ -196,7 +196,8 @@ class MultiUbsCoverageEnv(MultiAgentEnv):
             if self.sched[:, m, :].sum() > 0:
                 ubs_idx, chan_idx = np.where(self.sched[:, m, :])
                 sinr = (self.p_tx * g[ubs_idx, m]) / (p_itf[:, m, chan_idx].sum() + self.bw * self.n0)
-                self.rate_per_gt[m] = self.bw * np.log2(1 + sinr) * 1e-6  # Achievable rate of each GT (Mbps)
+                rate = self.bw * np.log2(1 + sinr) * 1e-6  # Achievable rate of each GT (Mbps)
+                self.rate_per_gt[m] = np.asarray(rate).item()
         self.rate_per_ubs = (self.sched.sum(-1) * self.rate_per_gt).sum(1)
 
         # ============================================================================================================ #
