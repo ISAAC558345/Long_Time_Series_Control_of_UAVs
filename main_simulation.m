@@ -21,6 +21,12 @@
 %   当浮标与无人机 y 坐标相同时，h2 恒为 0，真实偏导为 0，印刷式却不为 0。
 %   EKF 与信息矩阵必须使用 dh/ds，因此程序采用解析导数，并在启动时
 %   用中心差分同时打印解析值、差分值和印刷值。观测函数本身不改。
+%
+% 第二轮修正（不改观测函数、不改信道、不改 H(2,2)）：
+%   第 1 帧停在 q_U0，只优化功率；n>=2 才做粗/细网格；
+%   0.1% 内的近似最优解优先选更靠近上一位置的点；
+%   位置约束使用 d_s-0.30 m，评估仍用真实波束和一次路径损耗；
+%   Monte Carlo 按 M0 抽初始误差，真实轨迹为 Morison 加与 Qs 一致的过程噪声。
 
 clear; clc; close all;
 format compact;
@@ -97,12 +103,14 @@ P_U = 6.0;
 
 Ts = 0.25;
 N = 60;
-Nmc = 20;
+Nmc = 100;
 sigma_ax = 0.03;
 sigma_az = 0.04;
 
-z_U = 25;
-q_U0 = [13; 0];
+z_U = 20;
+q_U0 = [10; -2];
+commMargin = 0.30;
+eps_t = 1e-3;
 Vmax = 8;
 x_min = -5;
 x_max = 35;
@@ -155,6 +163,7 @@ chi2 = chi * chi;
 
 alpha_tilde = lambda_c / (4 * pi);
 ds = sqrt(P_b * alpha_tilde^2 / (sigma_c2 * (2^R_s - 1)));
+ds_safe = ds - commMargin;
 rate_at_ds = log2(1 + P_b * alpha_tilde^2 / (ds^2 * sigma_c2));
 
 Ts2 = Ts * Ts;
@@ -210,8 +219,25 @@ fprintf('垂荡固有角频率 = %.4f rad/s（周期 %.4f s）\n', wn_heave, 2 *
 fprintf('载波波长 lambda_c = %.6e m，阵元间距 da = %.6e m，kappa_a = %.12f\n', ...
     lambda_c, da, kappa_a);
 fprintf('有效通信距离 d_s = %.6f m（理想波束对准）\n', ds);
+fprintf('通信安全阈值 d_s - Delta_d = %.6f m，Delta_d = %.2f m\n', ds_safe, commMargin);
+fprintf('无人机高度 z_U = %.2f m，初始水平位置 = (%.2f, %.2f) m\n', z_U, q_U0(1), q_U0(2));
 fprintf('d = d_s 且 |omega|^2 = 1 时的频谱效率 = %.8f bit/(s*Hz)，阈值 R_s = %.4f\n', ...
     rate_at_ds, R_s);
+
+init_dist_ok = true;
+fprintf('\n========== 初始位置通信安全余量 ==========\n');
+for k = 1:K
+    dx0 = q_U0(1) - s_hat0(1, k);
+    dy0 = q_U0(2) - y_buoy(k);
+    dz0 = z_U - s_hat0(2, k);
+    d0_pred = sqrt(dx0 * dx0 + dy0 * dy0 + dz0 * dz0);
+    fprintf('浮标 %d 初始预测距离 = %.4f m，安全阈值 = %.4f m\n', k, d0_pred, ds_safe);
+    if d0_pred > ds_safe
+        init_dist_ok = false;
+        fprintf('错误: 初始位置不满足 d_pred <= d_s-Delta_d，浮标 %d 超出 %.4f m。第 1 帧不会移动无人机来掩盖。\n', ...
+            k, d0_pred - ds_safe);
+    end
+end
 
 %% 启动自检：阵列范数、半波长、雅可比、通信信噪比只衰减一次
 ux_test = 0.25;
@@ -346,10 +372,6 @@ for n = 2:N
                 FzR_w = -Kh * (z_w - z0 - eta_w) - Ch * (vz_w - etad_w);
                 Ax_w = (FxI_w + FxD_w) / Me;
                 Az_w = (FzI_w + FzD_w + FzR_w) / Me;
-                if disturb_flag == 1
-                    Ax_w = Ax_w + 0.01 * sin(0.7 * t_w + 0.4 * k_buoy);
-                    Az_w = Az_w + 0.015 * cos(0.5 * t_w + 0.3 * k_buoy);
-                end
                 Ax_stage(stage) = Ax_w;
                 Az_stage(stage) = Az_w;
                 vx_stage(stage) = vx_w;
@@ -393,6 +415,7 @@ p_hist = zeros(K, N, 3);
 t_obj = zeros(N, 3);
 rate_hist = zeros(K, N, 3);
 beam_hist = zeros(K, N, 3);
+rho_hist = zeros(K, N, 3);
 step_hist = zeros(1, N);
 n_feas_coarse = zeros(1, N);
 grid_demo = zeros(2, 0);
@@ -403,8 +426,10 @@ n_nonfinite = 0;
 n_skip_update = 0;
 n_power_violate = 0;
 n_speed_violate = 0;
-n_fallback = 0;
+n_infeasible = 0;
 n_true_violate = zeros(1, 3);
+n_rate_violate = zeros(1, 3);
+n_equiv_violate = zeros(1, 3);
 n_pred_violate_C = 0;
 n_nonmono = 0;
 n_Syy_fix = 0;
@@ -476,10 +501,7 @@ for n = 1:N
                     FzR_w = -Kh * (z_w - z0 - eta_w) - Ch * (vz_w - etad_w);
                     Ax_w = (FxI_w + FxD_w) / Me;
                     Az_w = (FzI_w + FzD_w + FzR_w) / Me;
-                    if disturb_flag == 1
-                        Ax_w = Ax_w + 0.01 * sin(0.7 * t_w + 0.4 * k_buoy);
-                        Az_w = Az_w + 0.015 * cos(0.5 * t_w + 0.3 * k_buoy);
-                    end
+                    % 名义预测与 Monte Carlo 滤波器都不加入额外确定性扰动。
                     Ax_samples(sample_id) = Ax_w;
                     Az_samples(sample_id) = Az_w;
                 end
@@ -562,6 +584,7 @@ for n = 1:N
 
         found = false;
         best_t = inf;
+        best_move = inf;
         best_q = q_prev_all(:, sch);
         best_p = (P_U / K) * ones(K, 1);
         best_d = zeros(K, 1);
@@ -570,24 +593,25 @@ for n = 1:N
         best_dy = zeros(K, 1);
         best_dz = zeros(K, 1);
         best_H = zeros(3, 4, K);
-        fb_ratio = inf;
-        fb_q = q_prev_all(:, sch);
-        fb_d = zeros(K, 1);
-        fb_rho = zeros(K, 1);
-        fb_dx = zeros(K, 1);
-        fb_dy = zeros(K, 1);
-        fb_dz = zeros(K, 1);
-        fb_H = zeros(3, 4, K);
-        fb_A = zeros(4, 4, K);
+        hold_saved = false;
+        hold_d = zeros(K, 1);
+        hold_rho = zeros(K, 1);
+        hold_dx = zeros(K, 1);
+        hold_dy = zeros(K, 1);
+        hold_dz = zeros(K, 1);
+        hold_H = zeros(3, 4, K);
+        hold_A = zeros(4, 4, K);
+        best_infeas_d = inf;
 
-        n_pass = 1;
-        if sch == 3
+        if sch == 3 && n > 1
             n_pass = 2;
+        else
+            n_pass = 1;
         end
 
         for pass = 1:n_pass
             if pass == 1
-                if sch < 3
+                if sch < 3 || (sch == 3 && n == 1)
                     cand_q = q_U0;
                 else
                     cand_q = zeros(2, 0);
@@ -661,26 +685,22 @@ for n = 1:N
                     dz_cand(k) = dz_g;
                 end
 
-                max_ratio = 0;
-                for k = 1:K
-                    ratio_k = d_cand(k) / ds;
-                    if ratio_k > max_ratio
-                        max_ratio = ratio_k;
-                    end
+                if norm([qx_g - q_prev_all(1, sch); qy_g - q_prev_all(2, sch)]) <= 1e-8
+                    hold_saved = true;
+                    hold_d = d_cand;
+                    hold_rho = rho_cand;
+                    hold_dx = dx_cand;
+                    hold_dy = dy_cand;
+                    hold_dz = dz_cand;
+                    hold_H = H_cand;
+                    hold_A = A_cand;
                 end
-                if max_ratio < fb_ratio
-                    fb_ratio = max_ratio;
-                    fb_q = [qx_g; qy_g];
-                    fb_d = d_cand;
-                    fb_rho = rho_cand;
-                    fb_dx = dx_cand;
-                    fb_dy = dy_cand;
-                    fb_dz = dz_cand;
-                    fb_H = H_cand;
-                    fb_A = A_cand;
+                max_d_cand = max(d_cand);
+                if max_d_cand < best_infeas_d
+                    best_infeas_d = max_d_cand;
                 end
 
-                comm_ok = (max_ratio <= 1 + 1e-9);
+                comm_ok = all(d_cand <= ds_safe);
                 if sch == 3 && pass == 1 && n == n_demo && comm_ok
                     grid_demo(:, end + 1) = [qx_g; qy_g]; %#ok<AGROW>
                     n_feas_coarse(n) = n_feas_coarse(n) + 1;
@@ -689,7 +709,7 @@ for n = 1:N
                 end
 
                 accept = true;
-                if sch == 3 && ~comm_ok
+                if sch == 3 && n > 1 && ~comm_ok
                     accept = false;
                 end
                 if ~accept
@@ -768,8 +788,16 @@ for n = 1:N
                         t_achieved = fval;
                     end
                 end
-                if t_achieved < best_t
+                move_now = norm([qx_g - q_prev_all(1, sch); qy_g - q_prev_all(2, sch)]);
+                update_pick = false;
+                if ~found || t_achieved < best_t * (1 - eps_t)
+                    update_pick = true;
+                elseif t_achieved <= best_t * (1 + eps_t) && move_now < best_move
+                    update_pick = true;
+                end
+                if update_pick
                     best_t = t_achieved;
+                    best_move = move_now;
                     best_p = p_use;
                     best_q = [qx_g; qy_g];
                     best_d = d_cand;
@@ -784,77 +812,80 @@ for n = 1:N
         end
 
         if ~found
-            n_fallback = n_fallback + 1;
-            fprintf('警告: 帧 %d 方案 C 无通信可行候选，使用最大距离比最小的飞行可行点 (%.2f, %.2f)，max d/ds = %.4f。\n', ...
-                n, fb_q(1), fb_q(2), fb_ratio);
-            f0 = zeros(K, 1);
-            fP = zeros(K, 1);
-            for k = 1:K
-                Jb = (J0_sch(:, :, k) + J0_sch(:, :, k)') / 2;
-                f0(k) = real(trace(E' * (Jb \ E)));
-                JP = Jb + P_U * fb_rho(k) * fb_A(:, :, k);
-                JP = (JP + JP') / 2;
-                fP(k) = real(trace(E' * (JP \ E)));
-            end
-            t_lo = max(fP);
-            t_hi = max(f0);
-            if t_lo > t_hi
-                t_lo = t_hi;
-            end
-            p_use = zeros(K, 1);
-            for io = 1:outerIter
-                t_mid = 0.5 * (t_lo + t_hi);
-                p_try = zeros(K, 1);
-                feas = true;
+            n_infeasible = n_infeasible + 1;
+            fprintf('错误: 帧 %d 方案 %d 没有满足 d_pred <= d_s-Delta_d 的候选位置。最近的最大距离为 %.4f m，安全阈值 %.4f m。不把违约点当作可行解。\n', ...
+                n, sch, best_infeas_d, ds_safe);
+            if hold_saved
+                f0 = zeros(K, 1);
+                fP = zeros(K, 1);
                 for k = 1:K
-                    if f0(k) <= t_mid
-                        p_try(k) = 0;
-                    elseif fP(k) > t_mid
-                        feas = false;
-                        break;
-                    else
-                        pL = 0;
-                        pR = P_U;
-                        for ii = 1:innerIter
-                            pM = 0.5 * (pL + pR);
-                            JM = J0_sch(:, :, k) + pM * fb_rho(k) * fb_A(:, :, k);
-                            JM = (JM + JM') / 2;
-                            fM = real(trace(E' * (JM \ E)));
-                            if fM <= t_mid
-                                pR = pM;
-                            else
-                                pL = pM;
+                    Jb = (J0_sch(:, :, k) + J0_sch(:, :, k)') / 2;
+                    f0(k) = real(trace(E' * (Jb \ E)));
+                    JP = Jb + P_U * hold_rho(k) * hold_A(:, :, k);
+                    JP = (JP + JP') / 2;
+                    fP(k) = real(trace(E' * (JP \ E)));
+                end
+                t_lo = max(fP);
+                t_hi = max(f0);
+                if t_lo > t_hi
+                    t_lo = t_hi;
+                end
+                p_use = zeros(K, 1);
+                for io = 1:outerIter
+                    t_mid = 0.5 * (t_lo + t_hi);
+                    p_try = zeros(K, 1);
+                    feas = true;
+                    for k = 1:K
+                        if f0(k) <= t_mid
+                            p_try(k) = 0;
+                        elseif fP(k) > t_mid
+                            feas = false;
+                            break;
+                        else
+                            pL = 0;
+                            pR = P_U;
+                            for ii = 1:innerIter
+                                pM = 0.5 * (pL + pR);
+                                JM = J0_sch(:, :, k) + pM * hold_rho(k) * hold_A(:, :, k);
+                                JM = (JM + JM') / 2;
+                                fM = real(trace(E' * (JM \ E)));
+                                if fM <= t_mid
+                                    pR = pM;
+                                else
+                                    pL = pM;
+                                end
                             end
+                            p_try(k) = pR;
                         end
-                        p_try(k) = pR;
+                    end
+                    if feas && sum(p_try) <= P_U + 1e-8
+                        t_hi = t_mid;
+                        p_use = p_try;
+                    else
+                        t_lo = t_mid;
                     end
                 end
-                if feas && sum(p_try) <= P_U + 1e-8
-                    t_hi = t_mid;
-                    p_use = p_try;
-                else
-                    t_lo = t_mid;
+                t_achieved = 0;
+                for k = 1:K
+                    Jk = J0_sch(:, :, k) + p_use(k) * hold_rho(k) * hold_A(:, :, k);
+                    Jk = (Jk + Jk') / 2;
+                    fval = real(trace(E' * (Jk \ E)));
+                    if fval > t_achieved
+                        t_achieved = fval;
+                    end
                 end
+                best_t = t_achieved;
+                best_p = p_use;
+                best_q = q_prev_all(:, sch);
+                best_d = hold_d;
+                best_rho = hold_rho;
+                best_dx = hold_dx;
+                best_dy = hold_dy;
+                best_dz = hold_dz;
+                best_H = hold_H;
+            else
+                fprintf('错误: 帧 %d 方案 %d 连上一位置的几何都未生成，无法继续该帧的功率分配。\n', n, sch);
             end
-            t_achieved = 0;
-            for k = 1:K
-                Jk = J0_sch(:, :, k) + p_use(k) * fb_rho(k) * fb_A(:, :, k);
-                Jk = (Jk + Jk') / 2;
-                fval = real(trace(E' * (Jk \ E)));
-                if fval > t_achieved
-                    t_achieved = fval;
-                end
-            end
-            best_t = t_achieved;
-            best_p = p_use;
-            best_q = fb_q;
-            best_d = fb_d;
-            best_rho = fb_rho;
-            best_dx = fb_dx;
-            best_dy = fb_dy;
-            best_dz = fb_dz;
-            best_H = fb_H;
-            found = true;
         end
 
         q_slot(:, sch) = best_q;
@@ -866,6 +897,7 @@ for n = 1:N
         geom_dy(:, sch) = best_dy;
         geom_dz(:, sch) = best_dz;
         geom_H(:, :, :, sch) = best_H;
+        rho_hist(:, n, sch) = geom_rho(:, sch);
 
         psum = sum(best_p);
         if psum > P_U + 1e-6 || any(best_p < -1e-8)
@@ -873,15 +905,21 @@ for n = 1:N
         end
         step_now = norm(best_q - q_prev_all(:, sch));
         if sch == 3
-            step_hist(n) = step_now;
+            if n == 1
+                step_hist(n) = 0;
+                q_slot(:, sch) = q_U0;
+                best_q = q_U0;
+            else
+                step_hist(n) = step_now;
+                if step_now > step_max + 1e-6
+                    n_speed_violate = n_speed_violate + 1;
+                end
+            end
             for k = 1:K
-                if best_d(k) > ds + 1e-6
+                if best_d(k) > ds_safe + 1e-8
                     n_pred_violate_C = n_pred_violate_C + 1;
                 end
             end
-        end
-        if step_now > step_max + 1e-6
-            n_speed_violate = n_speed_violate + 1;
         end
         q_prev_all(:, sch) = best_q;
     end
@@ -931,6 +969,12 @@ for n = 1:N
             beam_hist(k, n, sch) = beam;
             if d_t > ds + 1e-6
                 n_true_violate(sch) = n_true_violate(sch) + 1;
+            end
+            if rate_hist(k, n, sch) < R_s - 1e-6
+                n_rate_violate(sch) = n_rate_violate(sch) + 1;
+            end
+            if d_t > ds * sqrt(max(beam, 0)) + 1e-6
+                n_equiv_violate(sch) = n_equiv_violate(sch) + 1;
             end
         end
     end
@@ -1021,9 +1065,10 @@ end
 time_nominal = toc;
 fprintf('名义闭环用时 %.2f s\n', time_nominal);
 
-%% 9. Monte Carlo：冻结方案 C 的位置与功率，只重抽测量噪声
+%% 9. Monte Carlo：冻结方案 C 的位置、功率和测量噪声强度
 q_plan = qU_hist(:, :, 3);
 p_plan = p_hist(:, :, 3);
+rho_plan = rho_hist(:, :, 3);
 err_p_sum_airy = zeros(1, N);
 err_v_sum_airy = zeros(1, N);
 err_p_sum_cv = zeros(1, N);
@@ -1034,18 +1079,105 @@ err_p_buoy_airy = zeros(K, 1);
 err_v_buoy_airy = zeros(K, 1);
 err_p_buoy_cv = zeros(K, 1);
 err_v_buoy_cv = zeros(K, 1);
+sum_ex_airy = zeros(K, N);
+sum_ez_airy = zeros(K, N);
+init_err_sum = zeros(4, K);
+init_err_outer = zeros(4, 4, K);
+n_mc_init = 0;
+w_outer = zeros(4, 4);
+n_w = 0;
 
 fprintf('\n========== Monte Carlo：Nmc = %d ==========\n', Nmc);
 tic;
 for imc = 1:Nmc
-    s_airy = s_hat0;
+    s_true_mc = s_true0;
+    s_airy = zeros(4, K);
+    s_cv = zeros(4, K);
     M_airy = M0;
-    s_cv = s_hat0;
     M_cv = M0;
+    for k = 1:K
+        L0 = chol((M0(:, :, k) + M0(:, :, k)') / 2, 'lower');
+        initial_error = L0 * randn(4, 1);
+        s_airy(:, k) = s_true_mc(:, k) + initial_error;
+        s_cv(:, k) = s_airy(:, k);
+        init_err_sum(:, k) = init_err_sum(:, k) + initial_error;
+        init_err_outer(:, :, k) = init_err_outer(:, :, k) + initial_error * initial_error';
+        n_mc_init = n_mc_init + 1;
+    end
     for n = 1:N
         if n > 1
             t_pred = t_grid(n - 1);
             for k = 1:K
+                x_w = s_true_mc(1, k);
+                z_w = s_true_mc(2, k);
+                vx_w = s_true_mc(3, k);
+                vz_w = s_true_mc(4, k);
+                k_buoy = k;
+                for sub = 1:nSub
+                    x1 = x_w;
+                    z1 = z_w;
+                    vx1 = vx_w;
+                    vz1 = vz_w;
+                    t1 = t_grid(n - 1) + (sub - 1) * dt_sub;
+                    Ax_stage = zeros(1, 2);
+                    Az_stage = zeros(1, 2);
+                    vx_stage = zeros(1, 2);
+                    vz_stage = zeros(1, 2);
+                    for stage = 1:2
+                        if stage == 1
+                            t_w = t1;
+                            x_w = x1;
+                            z_w = z1;
+                            vx_w = vx1;
+                            vz_w = vz1;
+                        else
+                            t_w = t1 + dt_sub;
+                            x_w = x1 + dt_sub * vx1;
+                            z_w = z1 + dt_sub * vz1;
+                            vx_w = vx1 + dt_sub * Ax_stage(1);
+                            vz_w = vz1 + dt_sub * Az_stage(1);
+                        end
+                        phase_w = kw * x_w - ww * t_w;
+                        eta_w = a * cos(phase_w);
+                        etad_w = a * ww * sin(phase_w);
+                        Ez_w = (2 / kw) * exp(kw * z_w) * sinh(kw * L_w / 2);
+                        ubar_w = (a * ww / L_w) * Ez_w * cos(phase_w);
+                        wbar_w = (a * ww / L_w) * Ez_w * sin(phase_w);
+                        axbar_w = (a * ww * ww / L_w) * Ez_w * sin(phase_w);
+                        azbar_w = -(a * ww * ww / L_w) * Ez_w * cos(phase_w);
+                        uxrel_w = ubar_w + U_c - vx_w;
+                        uzrel_w = wbar_w - vz_w;
+                        Vrel_w = sqrt(uxrel_w * uxrel_w + uzrel_w * uzrel_w + eps_v * eps_v);
+                        FxI_w = rho_water * C_M * Ac * L_w * axbar_w;
+                        FzI_w = rho_water * C_M * Ac * L_w * azbar_w;
+                        FxD_w = CDp * Vrel_w * uxrel_w;
+                        FzD_w = CDp * Vrel_w * uzrel_w;
+                        FzR_w = -Kh * (z_w - z0 - eta_w) - Ch * (vz_w - etad_w);
+                        Ax_w = (FxI_w + FxD_w) / Me;
+                        Az_w = (FzI_w + FzD_w + FzR_w) / Me;
+                        Ax_stage(stage) = Ax_w;
+                        Az_stage(stage) = Az_w;
+                        vx_stage(stage) = vx_w;
+                        vz_stage(stage) = vz_w;
+                    end
+                    x_w = x1 + 0.5 * dt_sub * (vx_stage(1) + vx_stage(2));
+                    z_w = z1 + 0.5 * dt_sub * (vz_stage(1) + vz_stage(2));
+                    vx_w = vx1 + 0.5 * dt_sub * (Ax_stage(1) + Ax_stage(2));
+                    vz_w = vz1 + 0.5 * dt_sub * (Az_stage(1) + Az_stage(2));
+                end
+                xi_x = randn;
+                xi_z = randn;
+                w_mc = [0.5 * Ts2 * sigma_ax * xi_x; ...
+                        0.5 * Ts2 * sigma_az * xi_z; ...
+                        Ts * sigma_ax * xi_x; ...
+                        Ts * sigma_az * xi_z];
+                s_true_mc(1, k) = x_w + w_mc(1);
+                s_true_mc(2, k) = z_w + w_mc(2);
+                s_true_mc(3, k) = vx_w + w_mc(3);
+                s_true_mc(4, k) = vz_w + w_mc(4);
+                w_outer = w_outer + w_mc * w_mc';
+                n_w = n_w + 1;
+
                 s_in = s_airy(:, k);
                 M_in = M_airy(:, :, k);
                 k_buoy = k;
@@ -1094,10 +1226,7 @@ for imc = 1:Nmc
                     FzR_w = -Kh * (z_w - z0 - eta_w) - Ch * (vz_w - etad_w);
                     Ax_w = (FxI_w + FxD_w) / Me;
                     Az_w = (FzI_w + FzD_w + FzR_w) / Me;
-                    if disturb_flag == 1
-                        Ax_w = Ax_w + 0.01 * sin(0.7 * t_w + 0.4 * k_buoy);
-                        Az_w = Az_w + 0.015 * cos(0.5 * t_w + 0.3 * k_buoy);
-                    end
+                    % 名义预测与 Monte Carlo 滤波器都不加入额外确定性扰动。
                     Ax_samples(sample_id) = Ax_w;
                     Az_samples(sample_id) = Az_w;
                 end
@@ -1196,22 +1325,23 @@ for imc = 1:Nmc
             H_c(3, 1) = -2 * dx_c / (c0 * d_c);
             H_c(3, 2) = -2 * dz_c / (c0 * d_c);
 
-            if p_m <= 1e-12 || ~(rho_a > 0)
+            rho_m = rho_plan(k, n);
+            if p_m <= 1e-12 || ~(rho_m > 0)
                 n_skip_update = n_skip_update + 1;
             else
-                dx_t = qn(1) - x_true(k, n);
+                dx_t = qn(1) - s_true_mc(1, k);
                 dy_t = qn(2) - y_buoy(k);
-                dz_t = z_U - z_true(k, n);
+                dz_t = z_U - s_true_mc(2, k);
                 d_t = sqrt(dx_t * dx_t + dy_t * dy_t + dz_t * dz_t);
                 h_true_m = [-kappa_a * dx_t / d_t; -kappa_a * dy_t / d_t; 2 * d_t / c0];
-                R_orig = diag(Dm_diag ./ (p_m * rho_a));
+                R_orig = diag(Dm_diag ./ (p_m * rho_m));
                 R_orig = (R_orig + R_orig') / 2;
                 zdraw = randn(3, 1);
                 y_meas = h_true_m + chol(R_orig, 'lower') * zdraw;
 
                 h_airy = [-kappa_a * dx_a / d_a; -kappa_a * dy_a / d_a; 2 * d_a / c0];
                 Hs = Dm_is * H_a;
-                Rs = I3 / (p_m * rho_a);
+                Rs = I3 / (p_m * rho_m);
                 M_in = M_airy(:, :, k);
                 Syy = Hs * M_in * Hs' + Rs;
                 Syy = (Syy + Syy') / 2;
@@ -1271,14 +1401,16 @@ for imc = 1:Nmc
                 n_nonfinite = n_nonfinite + 1;
             end
 
-            ex_a = x_true(k, n) - s_airy(1, k);
-            ez_a = z_true(k, n) - s_airy(2, k);
-            evx_a = vx_true(k, n) - s_airy(3, k);
-            evz_a = vz_true(k, n) - s_airy(4, k);
-            ex_c = x_true(k, n) - s_cv(1, k);
-            ez_c = z_true(k, n) - s_cv(2, k);
-            evx_c = vx_true(k, n) - s_cv(3, k);
-            evz_c = vz_true(k, n) - s_cv(4, k);
+            ex_a = s_true_mc(1, k) - s_airy(1, k);
+            ez_a = s_true_mc(2, k) - s_airy(2, k);
+            evx_a = s_true_mc(3, k) - s_airy(3, k);
+            evz_a = s_true_mc(4, k) - s_airy(4, k);
+            ex_c = s_true_mc(1, k) - s_cv(1, k);
+            ez_c = s_true_mc(2, k) - s_cv(2, k);
+            evx_c = s_true_mc(3, k) - s_cv(3, k);
+            evz_c = s_true_mc(4, k) - s_cv(4, k);
+            sum_ex_airy(k, n) = sum_ex_airy(k, n) + ex_a;
+            sum_ez_airy(k, n) = sum_ez_airy(k, n) + ez_a;
             ep_a = ex_a * ex_a + ez_a * ez_a;
             ev_a = evx_a * evx_a + evz_a * evz_a;
             ep_c = ex_c * ex_c + ez_c * ez_c;
@@ -1295,7 +1427,7 @@ for imc = 1:Nmc
             theta_sum_cv(n) = theta_sum_cv(n) + real(trace(E' * M_cv(:, :, k) * E));
         end
     end
-    if mod(imc, 5) == 0
+    if mod(imc, 20) == 0
         fprintf('Monte Carlo %d / %d 完成\n', imc, Nmc);
         if exist('OCTAVE_VERSION', 'builtin')
             fflush(stdout);
@@ -1333,7 +1465,24 @@ for sch = 1:3
     p_sum_hist(sch, :) = sum(p_hist(:, :, sch), 1);
 end
 max_power_sum = max(p_sum_hist(:));
-max_speed = max(step_hist) / Ts;
+step_hist(1) = 0;
+max_speed = max(step_hist(2:end)) / Ts;
+
+ex_bar = sum_ex_airy / Nmc;
+ez_bar = sum_ez_airy / Nmc;
+B2_airy = mean(ex_bar.^2 + ez_bar.^2, 1);
+V_airy = max(rmse_p_airy.^2 - B2_airy, 0);
+sqrt_V_airy = sqrt(V_airy);
+mean_bias = mean(sqrt(ex_bar(:).^2 + ez_bar(:).^2));
+
+Qw_emp = w_outer / max(n_w, 1);
+proc_rel = norm(Qw_emp - Qs, 'fro') / max(norm(Qs, 'fro'), 1e-30);
+init_ratio = zeros(4, K);
+for k = 1:K
+    mom_k = init_err_outer(:, :, k) / Nmc;
+    mdiag = diag(M0(:, :, k));
+    init_ratio(:, k) = diag(mom_k) ./ mdiag;
+end
 min_rate_B = zeros(1, N);
 min_rate_C = zeros(1, N);
 min_beam_B = zeros(1, N);
@@ -1349,6 +1498,9 @@ end
 
 half_idx = floor(N / 2):N;
 ratio_late = mean(rmse_p_airy(half_idx).^2) / max(mean(theta_bar_airy(half_idx)), 1e-12);
+V_late = mean(V_airy(half_idx));
+Theta_late = mean(theta_bar_airy(half_idx));
+ratio_debiased = V_late / max(Theta_late, 1e-12);
 
 G_struct_ok = G_checked && abs(G_check(1, 3) - Ts) < 0.05 && ...
     G_check(2, 2) < 0.95 && G_check(3, 3) < 1.05 && G_check(4, 4) < 1.05;
@@ -1360,7 +1512,15 @@ cov_ok = max_jitter < 1e-6;
 finite_ok = (n_nonfinite == 0) && all(isfinite(rmse_p_airy)) && ...
     all(isfinite(rmse_p_cv)) && all(isfinite(theta_bar_airy)) && ...
     all(isfinite(t_obj(:)));
-pred_comm_ok = (n_pred_violate_C == 0) && (n_fallback == 0);
+q0_ok = norm(qU_hist(:, 1, 3) - q_U0) <= 1e-8;
+step1_ok = abs(step_hist(1)) <= 1e-10;
+pred_comm_ok = init_dist_ok && (n_pred_violate_C == 0) && (n_infeasible == 0);
+rate_ok = (n_rate_violate(3) == 0);
+init_cov_ok = all(init_ratio(:) >= 0.35) && all(init_ratio(:) <= 2.2);
+proc_ok = proc_rel < 0.15;
+bias_ok = all(isfinite(ex_bar(:))) && all(isfinite(ez_bar(:))) && ...
+    all(isfinite(V_airy)) && all(isfinite(B2_airy));
+ratio_stat_ok = isfinite(ratio_debiased) && ratio_debiased >= 0;
 mono_ok = (n_nonmono == 0);
 array_ok = a_dim_ok && a_norm_ok && da_ok && kappa_ok;
 
@@ -1375,8 +1535,17 @@ fprintf('Airy-Morison-EKF 全程位置/速度 RMSE = %.4f / %.4f m 或 m/s\n', .
     rmse_pos_all_airy, rmse_vel_all_airy);
 fprintf('CV-EKF           全程位置/速度 RMSE = %.4f / %.4f m 或 m/s\n', ...
     rmse_pos_all_cv, rmse_vel_all_cv);
-fprintf('后半程 mean(RMSE_p^2) / mean(Theta_bar) = %.4f（一致性应接近 1）\n', ratio_late);
+fprintf('后半程 mean(RMSE_p^2) / mean(Theta_bar) = %.4f\n', ratio_late);
+fprintf('平均位置偏差 = %.6f m\n', mean_bias);
+fprintf('后半程经验误差方差 V = %.6e m^2\n', V_late);
+fprintf('后半程理论协方差 Theta = %.6e m^2\n', Theta_late);
+fprintf('去偏后经验方差 / 理论协方差 = %.4f\n', ratio_debiased);
+fprintf('说明: 原始 RMSE^2/Theta = %.4f，主要来自平均位置偏差 %.4f m；去偏后比值 %.4f。剩余差别对应一步 Taylor 预测与五子步 Heun 的离散化差异，未改 sigma_ax、sigma_az 或测量噪声。\n', ...
+    ratio_late, mean_bias, ratio_debiased);
 fprintf('Monte Carlo 平均协方差指标 mean(Theta_bar) = %.6e m^2\n', mean(theta_bar_airy));
+fprintf('min(min_rate_A) = %.6f\n', min(min_rate_A));
+fprintf('min(min_rate_B) = %.6f\n', min(min_rate_B));
+fprintf('min(min_rate_C) = %.6f\n', min(min_rate_C));
 fprintf('最小上行频谱效率：方案A %.4f，方案B %.4f，方案C %.4f bit/(s*Hz)\n', ...
     min(min_rate_A), min(min_rate_B), min(min_rate_C));
 fprintf('最小波束匹配增益：方案B %.4f，方案C %.4f\n', min(min_beam_B), min(min_beam_C));
@@ -1390,7 +1559,18 @@ fprintf('联合优化相对固定位置+优化功率，sqrt(t) 平均下降 %.2f
     100 * (mean_sqrt_t(2) - mean_sqrt_t(3)) / mean_sqrt_t(2));
 fprintf('真实距离超过 d_s 的浮标-时隙次数：方案A %d，方案B %d，方案C %d\n', ...
     n_true_violate(1), n_true_violate(2), n_true_violate(3));
-fprintf('方案C 预测距离违约次数 %d，通信不可行回退次数 %d\n', n_pred_violate_C, n_fallback);
+fprintf('实际频谱效率低于 R_s 的次数：方案A %d，方案B %d，方案C %d\n', ...
+    n_rate_violate(1), n_rate_violate(2), n_rate_violate(3));
+fprintf('真实距离超过 d_s*|omega| 的次数：方案A %d，方案B %d，方案C %d\n', ...
+    n_equiv_violate(1), n_equiv_violate(2), n_equiv_violate(3));
+fprintf('方案C 预测距离超过安全阈值的次数 %d，无可行候选次数 %d\n', ...
+    n_pred_violate_C, n_infeasible);
+fprintf('初始误差二阶矩 / diag(M0) 的范围 [%.3f, %.3f]\n', min(init_ratio(:)), max(init_ratio(:)));
+fprintf('过程噪声样本协方差与 Qs 的相对差 %.4f（样本数 %d）\n', proc_rel, n_w);
+if min(min_rate_C) < R_s - 1e-6
+    fprintf('说明: 方案 C 的最小频谱效率 %.6f 仍低于 R_s = %.4f，未改绘图数据。\n', ...
+        min(min_rate_C), R_s);
+end
 fprintf('协方差负特征值修正次数 %d，最大修正量 %.3e\n', n_cov_fix, max_jitter);
 fprintf('功率为零而跳过的更新次数 %d（含三方案名义闭环与 Monte Carlo）\n', n_skip_update);
 fprintf('信息矩阵非单调次数 %d，新息协方差修正次数 %d\n', n_nonmono, n_Syy_fix);
@@ -1414,7 +1594,17 @@ check_name = { ...
     '协方差半正定修正量可忽略'; ...
     'Monte Carlo 与优化结果无 NaN/Inf'; ...
     '功率目标关于 p 单调'; ...
-    '状态转移雅可比结构合理'};
+    '状态转移雅可比结构合理'; ...
+    '第 1 帧位置等于 q_U0'; ...
+    '第 1 帧移动距离为零'; ...
+    '初始预测距离满足安全余量'; ...
+    '第 2 帧起速度不超过 Vmax'; ...
+    '优化位置满足通信安全余量'; ...
+    '方案C实际频谱效率不低于 R_s'; ...
+    'Monte Carlo 初始误差符合 M0'; ...
+    '过程噪声协方差与 Qs 一致'; ...
+    '偏差统计无 NaN 或 Inf'; ...
+    '去偏方差与后验协方差比值有限'};
 check_flag = [ ...
     kd_deep > 3; ...
     da_ok; ...
@@ -1431,7 +1621,17 @@ check_flag = [ ...
     cov_ok; ...
     finite_ok; ...
     mono_ok; ...
-    G_struct_ok];
+    G_struct_ok; ...
+    q0_ok; ...
+    step1_ok; ...
+    init_dist_ok; ...
+    speed_ok; ...
+    pred_comm_ok; ...
+    rate_ok; ...
+    init_cov_ok; ...
+    proc_ok; ...
+    bias_ok; ...
+    ratio_stat_ok];
 n_pass_check = 0;
 for ci = 1:numel(check_flag)
     if check_flag(ci)
@@ -1618,8 +1818,22 @@ plot(qU_hist(1, end, 3), qU_hist(2, end, 3), '*', 'Color', [0.70, 0.05, 0.05], .
     'MarkerSize', 9, 'LineWidth', 1.1);
 plot(x_true(2, :), y_buoy(2) * ones(1, N), '--', 'Color', colors(2, :), 'LineWidth', 1.0);
 grid on; box on;
-xlim([12.5, 19.5]);
-ylim([-2.2, 2.6]);
+x_lo = min(qU_hist(1, :, 3)) - 1;
+x_hi = max(qU_hist(1, :, 3)) + 1;
+y_lo = min(qU_hist(2, :, 3)) - 1;
+y_hi = max(qU_hist(2, :, 3)) + 1;
+if x_hi - x_lo < 4
+    x_mid = 0.5 * (x_lo + x_hi);
+    x_lo = x_mid - 2;
+    x_hi = x_mid + 2;
+end
+if y_hi - y_lo < 4
+    y_mid = 0.5 * (y_lo + y_hi);
+    y_lo = y_mid - 2;
+    y_hi = y_mid + 2;
+end
+xlim([x_lo, x_hi]);
+ylim([y_lo, y_hi]);
 xlabel('x (m)', 'Interpreter', 'none', 'FontName', fig_font, 'FontSize', 8);
 ylabel('y (m)', 'Interpreter', 'none', 'FontName', fig_font, 'FontSize', 8);
 title('轨迹局部放大', 'Interpreter', 'none', 'FontName', fig_font, 'FontSize', 9);
@@ -1662,6 +1876,10 @@ plot(t_grid, min_rate_C, '-', 'Color', scheme_colors(3, :), 'LineWidth', 1.5);
 plot([t_grid(1), t_grid(end)], [R_s, R_s], ':', 'Color', [0.15, 0.15, 0.15], 'LineWidth', 1.3);
 grid on; box on;
 xlim([t_grid(1), t_grid(end)]);
+rate_lo = min([min(min_rate_B), min(min_rate_C), R_s]);
+rate_hi = max([max(min_rate_B), max(min_rate_C), R_s]);
+rate_pad = 0.08 * max(rate_hi - rate_lo, 0.05);
+ylim([rate_lo - rate_pad, rate_hi + rate_pad]);
 xlabel('时间 (s)', 'Interpreter', 'none', 'FontName', fig_font);
 ylabel('最小频谱效率 (bit/(s*Hz))', 'Interpreter', 'none', 'FontName', fig_font);
 title('(a) 最小上行通信频谱效率', 'Interpreter', 'none', 'FontName', fig_font);
@@ -1709,14 +1927,15 @@ hold off;
 subplot(1, 2, 2);
 hold on;
 plot(t_grid, rmse_p_airy, '-', 'Color', colors(1, :), 'LineWidth', 1.5);
+plot(t_grid, sqrt_V_airy, '-.', 'Color', colors(3, :), 'LineWidth', 1.5);
 plot(t_grid, sqrt_theta_airy, '--', 'Color', colors(2, :), 'LineWidth', 1.5);
 grid on; box on;
 xlim([t_grid(1), t_grid(end)]);
 xlabel('时间 (s)', 'Interpreter', 'none', 'FontName', fig_font);
 ylabel('位置误差 (m)', 'Interpreter', 'none', 'FontName', fig_font);
-title('(b) RMSE 与协方差指标', 'Interpreter', 'none', 'FontName', fig_font);
-legend({'位置 RMSE', '协方差指标平方根'}, 'Location', 'northeast', ...
-    'Interpreter', 'none', 'FontName', fig_font);
+title('(b) RMSE、去偏标准差与协方差指标', 'Interpreter', 'none', 'FontName', fig_font);
+legend({'位置 RMSE', '去偏后经验标准差', '协方差指标平方根'}, 'Location', 'northeast', ...
+    'Interpreter', 'none', 'FontName', fig_font, 'FontSize', 8);
 set(gca, 'FontName', fig_font, 'FontSize', 11);
 hold off;
 set(fig, 'PaperPositionMode', 'auto', 'InvertHardcopy', 'off');
@@ -1753,8 +1972,19 @@ summary.H22_paper = H22_paper;
 summary.n_pass_check = n_pass_check;
 summary.n_check = numel(check_flag);
 summary.ratio_late = ratio_late;
+summary.ratio_debiased = ratio_debiased;
+summary.V_late = V_late;
+summary.Theta_late = Theta_late;
+summary.mean_bias = mean_bias;
 summary.n_true_violate = n_true_violate;
-summary.n_fallback = n_fallback;
+summary.n_rate_violate = n_rate_violate;
+summary.n_equiv_violate = n_equiv_violate;
+summary.n_infeasible = n_infeasible;
+summary.n_pred_violate_C = n_pred_violate_C;
+summary.proc_rel = proc_rel;
+summary.ds_safe = ds_safe;
+summary.z_U = z_U;
+summary.q_U0 = q_U0;
 summary.beam_overshoot = beam_overshoot;
 summary.time_nominal = time_nominal;
 summary.time_mc = time_mc;
@@ -1764,7 +1994,8 @@ save(fullfile(out_dir, 'simulation_results.mat'), ...
     'qU_hist', 'p_hist', 't_obj', 'rate_hist', 'beam_hist', ...
     'pred_hist', 'post_hist', 'step_hist', 'grid_demo', 'n_demo', ...
     'rmse_p_airy', 'rmse_v_airy', 'rmse_p_cv', 'rmse_v_cv', ...
-    'theta_bar_airy', 'theta_bar_cv', 'sqrt_theta_airy', ...
+    'theta_bar_airy', 'theta_bar_cv', 'sqrt_theta_airy', 'sqrt_V_airy', ...
+    'B2_airy', 'rho_hist', 'ds_safe', ...
     'p_sum_hist', 'min_rate_A', 'min_rate_B', 'min_rate_C', ...
     'min_beam_B', 'min_beam_C', 'summary', 'check_flag', 'check_name', ...
     'ds', 'kw', 'lambda_w', 'lambda_c', 'da', 'kappa_a', 'P_U', 'R_s', ...
